@@ -2,7 +2,7 @@ pattern_id: common.tagging.required_tags
 name: Required Azure Resource Tags
 description: Detects missing required tags for FedRAMP compliance
 family: COMMON
-severity: MEDIUM
+severity: LOW
 pattern_type: resource
 languages:
   bicep:
@@ -15,16 +15,17 @@ languages:
       - not_contains_key:CostCenter
     regex_fallback: resource\s+\w+\s+'[^']+'
   terraform:
-    ast_queries:
-    - resource_type: azurerm_*
-      attribute: tags
-      conditions:
-      - not_contains_key:Environment
-      - not_contains_key:Owner
-    regex_fallback: resource\s+"azurerm_
+    # Only resource types whose provider schema accepts `tags` are checked; tags given as an
+    # expression (var.tags, merge(...)) cannot be resolved statically and are not flagged.
+    tag_check:
+      provider_prefix: azurerm_
+      taggable_types: terraform/azurerm-taggable-resources.json
+      required_keys:
+      - Environment
+      - Owner
 finding:
   title_template: Missing required resource tags
-  description_template: Resource lacks required tags for governance and cost tracking.
+  description_template: Taggable resource lacks the Environment/Owner tags used for inventory accountability (CM-8). Tag keys are an organizational convention, not a FedRAMP requirement.
   remediation_template: "Add required tags:\ntags: {\n  Environment: 'Production'  // or Dev, Test, Staging\n  Owner: 'security-team@example.com'\n  CostCenter: 'CC-12345'\n  DataClassification: 'Confidential'\n  ComplianceScope: 'FedRAMP-High'\n}\n"
 tags:
 - governance
@@ -32,23 +33,25 @@ tags:
 - compliance
 nist_controls:
 - cm-8
+- cm-8.4
 related_ksis:
-- KSI-CNA-RNT
+- KSI-PIY-GIV
 ssp_mapping:
   control_family: CM - Configuration Management
   control_numbers:
   - CM-8
+  - CM-8(4)
   ssp_sections:
-  - section: 'CM-8: Unknown'
-    description_template: The system implements Unknown Requirement controls in accordance with FedRAMP 20x requirements. Requirement statement not available... Implementation leverages Azure native services combined with application-level controls and automated monitoring to ensure continuous compliance.
-    implementation_details: Azure services including Azure Monitor are configured to enforce compliance requirements. Infrastructure-as-code (Bicep/Terraform) templates ensure consistent deployment across environments. Automated compliance checking in CI/CD pipelines validates all changes against Unknown Requirement requirements before deployment.
+  - section: 'CM-8: System Component Inventory'
+    description_template: Resource tags record the environment and accountable owner of each component so inventories generated from Azure Resource Graph identify who is responsible for it.
+    implementation_details: Tags are declared in infrastructure-as-code and can be enforced at deployment with Azure Policy (require-tag / inherit-tag definitions).
     evidence_references:
     - Configuration exports
     - Compliance reports
 compliance_frameworks:
   fedramp_20x:
-    requirement_id: KSI-CNA-RNT
-    requirement_name: Restrict Network Traffic
+    requirement_id: KSI-PIY-GIV
+    requirement_name: Generating Inventories
     impact_levels:
     - Low
     - Moderate

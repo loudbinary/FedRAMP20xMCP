@@ -289,3 +289,80 @@ output resourceLocation string = location
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+class TestTerraformRequiredTags:
+    """common.tagging.required_tags on Terraform: schema-aware, literal tag maps only."""
+
+    PATTERN_ID = "common.tagging.required_tags"
+
+    @pytest.fixture
+    def analyzer(self):
+        return GenericPatternAnalyzer()
+
+    def _findings(self, analyzer, code):
+        result = analyzer.analyze(code, "terraform")
+        return [f for f in result.findings if getattr(f, 'pattern_id', None) == self.PATTERN_ID]
+
+    def test_untaggable_resource_not_flagged(self, analyzer):
+        code = '''resource "azurerm_role_assignment" "acr_pull" {
+  scope                = var.acr_id
+  role_definition_name = "AcrPull"
+  principal_id         = var.principal_id
+}'''
+        assert self._findings(analyzer, code) == []
+
+    def test_taggable_resource_without_tags_flagged(self, analyzer):
+        code = '''resource "azurerm_resource_group" "rg" {
+  name     = "rg-dev"
+  location = "eastus"
+}'''
+        findings = self._findings(analyzer, code)
+        assert len(findings) == 1
+        assert findings[0].line_number == 1
+        assert findings[0].ksi_id == "KSI-PIY-GIV"
+        assert "Environment, Owner" in findings[0].code_snippet
+
+    def test_literal_map_missing_key_flagged(self, analyzer):
+        code = '''resource "azurerm_resource_group" "rg" {
+  name = "rg-dev"
+  tags = {
+    project = "intelli"
+    # Owner = "commented out does not count"
+    Environment = "dev"
+  }
+}'''
+        findings = self._findings(analyzer, code)
+        assert len(findings) == 1
+        assert findings[0].code_snippet.endswith("missing tags Owner")
+
+    def test_complete_tags_case_insensitive_not_flagged(self, analyzer):
+        code = '''resource "azurerm_resource_group" "rg" {
+  name = "rg-dev"
+  tags = { environment = "dev", "OWNER" = "devops@example.com" }
+}'''
+        assert self._findings(analyzer, code) == []
+
+    def test_expression_tags_not_flagged(self, analyzer):
+        code = '''resource "azurerm_resource_group" "a" {
+  name = "a"
+  tags = var.tags
+}
+resource "azurerm_resource_group" "b" {
+  name = "b"
+  tags = merge(var.tags, { Owner = "x" })
+}'''
+        assert self._findings(analyzer, code) == []
+
+    def test_nested_tags_and_strings_ignored(self, analyzer):
+        code = '''resource "azurerm_resource_group" "rg" {
+  name = "tags = { Environment = 1 }"
+  lifecycle {
+    ignore_changes = [tags]
+  }
+  description = <<-EOT
+    tags = {}
+  EOT
+}'''
+        findings = self._findings(analyzer, code)
+        assert len(findings) == 1
+        assert "Environment, Owner" in findings[0].code_snippet
