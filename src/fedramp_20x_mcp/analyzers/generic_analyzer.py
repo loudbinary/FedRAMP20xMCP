@@ -20,6 +20,125 @@ _FAMILY_SUCCESSORS = {"ADS": "CDS", "FSI": "AFC", "UCM": "CMU", "PVA": "IVV",
                       "ICP": "IEC", "RSC": "SCG", "TPR": "SCR"}
 _CROSSWALK: Optional[Dict[str, Any]] = None
 
+# Terraform/HCL scanning helpers for the schema-aware tag check.
+_TF_RESOURCE = re.compile(r'^[ \t]*resource[ \t]+"(?P<type>[^"]+)"[ \t]+"(?P<name>[^"]+)"[ \t]*\{', re.M)
+_TF_TAGS_ATTR = re.compile(r'^[ \t]*tags[ \t]*=[ \t]*', re.M)
+_TF_MAP_KEY = re.compile(r'(?:^|(?<=[{,]))[ \t]*(?:"(?P<quoted>[^"]+)"|(?P<bare>[\w.\-]+))[ \t]*[=:]', re.M)
+_HCL_HEREDOC = re.compile(r'<<-?(\w+)[ \t]*\n')
+_TAGGABLE_CACHE: Dict[Path, Set[str]] = {}
+
+
+def _load_taggable_types(path: Path) -> Set[str]:
+    """Load (and cache) the set of resource types whose provider schema accepts `tags`."""
+    if path not in _TAGGABLE_CACHE:
+        import json
+        with open(path, encoding="utf-8") as f:
+            _TAGGABLE_CACHE[path] = set(json.load(f)["resource_types"])
+    return _TAGGABLE_CACHE[path]
+
+
+def _hcl_mask(text: str) -> str:
+    """
+    Blank out string contents, comments and heredoc bodies so structural scans ignore them.
+
+    Length and newlines are preserved, so offsets into the result are valid in the original.
+    Quote characters are kept, which lets callers tell a quoted key from blank space.
+    """
+    out = list(text)
+    n = len(text)
+
+    def blank(start: int, end: int) -> None:
+        for k in range(start, min(end, n)):
+            if out[k] != '\n':
+                out[k] = ' '
+
+    i = 0
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n and text[j] != '"' and text[j] != '\n':
+                if text[j] == '\\':
+                    j += 2
+                    continue
+                if text.startswith('${', j):
+                    # Skip the interpolation, which may itself contain quoted strings
+                    depth, j = 1, j + 2
+                    while j < n and depth:
+                        depth += {'{': 1, '}': -1}.get(text[j], 0)
+                        j += 1
+                    continue
+                j += 1
+            blank(i + 1, j)
+            i = j + 1
+        elif c == '#' or text.startswith('//', i):
+            j = text.find('\n', i)
+            j = n if j == -1 else j
+            blank(i, j)
+            i = j
+        elif text.startswith('/*', i):
+            j = text.find('*/', i + 2)
+            j = n if j == -1 else j + 2
+            blank(i, j)
+            i = j
+        elif c == '<' and (m := _HCL_HEREDOC.match(text, i)):
+            end = re.compile(r'^[ \t]*' + re.escape(m.group(1)) + r'[ \t]*$', re.M).search(text, m.end())
+            blank(m.end(), end.start() if end else n)
+            i = end.end() if end else n
+        else:
+            i += 1
+    return ''.join(out)
+
+
+def _hcl_matching_brace(masked: str, open_idx: int) -> int:
+    """Index of the brace closing the one at open_idx (len(masked) if unbalanced)."""
+    depth = 0
+    for k in range(open_idx, len(masked)):
+        if masked[k] in '{[(':
+            depth += 1
+        elif masked[k] in '}])':
+            depth -= 1
+            if depth == 0:
+                return k
+    return len(masked)
+
+
+def _hcl_top_level(masked: str, start: int, end: int) -> List[bool]:
+    """For each offset in [start, end), whether it sits at nesting depth 0 within that span."""
+    flags, depth = [], 0
+    for k in range(start, end):
+        if masked[k] in '}])':
+            depth -= 1
+        flags.append(depth == 0)
+        if masked[k] in '{[(':
+            depth += 1
+    return flags
+
+
+def _tf_literal_tag_keys(code: str, masked: str, start: int, end: int) -> Optional[Set[str]]:
+    """
+    Lower-cased tag keys of the resource body in [start, end).
+
+    Returns an empty set when the body has no top-level `tags` attribute, and None when
+    `tags` is an expression (var.tags, merge(...)) that cannot be resolved statically.
+    """
+    top = _hcl_top_level(masked, start, end)
+    attr = next((m for m in _TF_TAGS_ATTR.finditer(masked, start, end) if top[m.start() - start]), None)
+    if attr is None:
+        return set()
+    if masked[attr.end():attr.end() + 1] != '{':
+        return None
+    map_start = attr.end() + 1
+    map_end = _hcl_matching_brace(masked, attr.end())
+    map_top = _hcl_top_level(masked, map_start, map_end)
+    keys = set()
+    for m in _TF_MAP_KEY.finditer(code, map_start, map_end):
+        key_pos = m.start('quoted') - 1 if m.group('quoted') is not None else m.start('bare')
+        # Skip keys inside nested values and anything the mask blanked (comments, strings)
+        if map_top[key_pos - map_start] and masked[key_pos] != ' ':
+            keys.add((m.group('quoted') or m.group('bare')).lower())
+    return keys
+
 
 def _current_ids_for(rule_id: str) -> List[str]:
     """Resolve a (possibly legacy) rule/KSI ID to its CR26 ID(s) via the bundled crosswalk."""
@@ -587,7 +706,13 @@ class GenericPatternAnalyzer:
                 pattern, lang_config['regex_fallback'], code, file_path
             )
             findings.extend(regex_findings)
-        
+
+        # Terraform resource tag check (schema-aware, see _check_terraform_tags)
+        if 'tag_check' in lang_config:
+            findings.extend(self._check_terraform_tags(
+                pattern, lang_config['tag_check'], code, file_path
+            ))
+
         # Check positive/negative indicators
         # For "missing" patterns with BOTH positive and negative indicators:
         # - positive_indicators = things that trigger the check (e.g., hardcoded secrets)
@@ -777,7 +902,48 @@ class GenericPatternAnalyzer:
             ))
         
         return findings
-    
+
+    def _check_terraform_tags(
+        self,
+        pattern: Pattern,
+        config: Dict[str, Any],
+        code: str,
+        file_path: str
+    ) -> List[Finding]:
+        """
+        Flag Terraform resources that accept `tags` but lack the required tag keys.
+
+        Resource types outside the taggable list (generated from the provider schema) are
+        skipped, as are tags given as an expression (var.tags, merge(...)), which cannot be
+        resolved statically. Required keys are compared case-insensitively, as Azure does.
+        """
+        findings: List[Finding] = []
+        prefix = config.get('provider_prefix', '')
+        taggable = _load_taggable_types(self.pattern_loader.patterns_dir.parent / config['taggable_types'])
+        required = config.get('required_keys', [])
+
+        masked = _hcl_mask(code)
+        for match in _TF_RESOURCE.finditer(masked):
+            rtype = code[match.start('type'):match.end('type')]
+            rname = code[match.start('name'):match.end('name')]
+            if not rtype.startswith(prefix) or rtype not in taggable:
+                continue
+            body_start = match.end()
+            body_end = _hcl_matching_brace(masked, body_start - 1)
+            keys = _tf_literal_tag_keys(code, masked, body_start, body_end)
+            if keys is None:
+                continue
+            missing = [k for k in required if k.lower() not in keys]
+            if not missing:
+                continue
+            line_number = code[:match.start()].count('\n') + 1
+            findings.append(self._create_finding(
+                pattern, file_path, None, line_number=line_number,
+                code_snippet=f"{rtype}.{rname}: missing tags {', '.join(missing)}"
+            ))
+
+        return findings
+
     def _check_indicators(
         self,
         pattern: Pattern,
